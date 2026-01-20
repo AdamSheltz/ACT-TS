@@ -1,0 +1,108 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: node-disk-usage-report
+  namespace: kube-system
+  labels:
+    app: node-disk-usage-report
+spec:
+  # NOTE: A single Job runs on ONE node.
+  # If you want "one per node", use the Job pattern below ("job per node") or Indexed Job with automation.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: node-disk-usage-report
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: reporter
+        image: alpine:3.20
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Tools: du/find/df/awk/sort are present in busybox; add coreutils for nicer du flags.
+          apk add --no-cache coreutils findutils >/dev/null 2>&1 || true
+
+          NODE_NAME="${NODE_NAME:-unknown}"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          echo "============================================================"
+          echo "Node disk usage report"
+          echo "Node: ${NODE_NAME}"
+          echo "Time (UTC): ${TS}"
+          echo "Host mount: /host (read-only)"
+          echo "============================================================"
+          echo
+          echo "== Filesystems (host) =="
+          df -hT /host || true
+          echo
+
+          # Directories to scan (adjust as needed)
+          SCAN_PATHS="/host/var /host/usr /host/opt /host/home /host/etc /host/root /host/srv /host/tmp"
+
+          echo "== Top directories by size (GiB), highest -> lowest =="
+          echo "(Note: this is *apparent size* of directories; it does not include other mounted filesystems.)"
+          echo
+
+          for p in $SCAN_PATHS; do
+            if [ -d "$p" ]; then
+              echo "---- ${p#/host} ----"
+              du -x --apparent-size -B1G -d 2 "$p" 2>/dev/null \
+                | awk '{printf "%d\t%s\n",$1,$2}' \
+                | sort -nr \
+                | awk 'BEGIN{print "GiB\tPATH"} {gsub("^/host","",$2); printf "%d\t%s\n",$1,$2}' \
+                | head -n 60
+              echo
+            fi
+          done
+
+          echo "== Largest directories directly under / (GiB) =="
+          du -x --apparent-size -B1G -d 1 /host 2>/dev/null \
+            | awk '{printf "%d\t%s\n",$1,$2}' \
+            | sort -nr \
+            | awk 'BEGIN{print "GiB\tPATH"} {gsub("^/host","",$2); printf "%d\t%s\n",$1,$2}'
+          echo
+
+          echo "== Top 50 largest files on the node (GiB) =="
+          echo "(This can take longer on large disks.)"
+          find /host -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
+            | sort -nr \
+            | head -n 50 \
+            | awk 'BEGIN{print "GiB\tBYTES\tPATH"} {gib=$1/1024/1024/1024; gsub("^/host","",$2); printf "%.2f\t%s\t%s\n",gib,$1,$2}'
+          echo
+
+          echo "Report complete."
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+          readOnly: true
+        resources:
+          requests:
+            cpu: 20m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
