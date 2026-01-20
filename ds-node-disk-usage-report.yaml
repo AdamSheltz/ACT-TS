@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-disk-usage-report
+  namespace: kube-system
+  labels:
+    app: node-disk-usage-report
+spec:
+  selector:
+    matchLabels:
+      app: node-disk-usage-report
+  template:
+    metadata:
+      labels:
+        app: node-disk-usage-report
+    spec:
+      # Reads host filesystem; no need for hostNetwork.
+      # Requires access to mount the host root at /host.
+      containers:
+      - name: reporter
+        image: alpine:3.20
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          # Tools: du/find/df/awk/sort are present in busybox; add coreutils for better formatting.
+          # (If you want to avoid installing, remove coreutils and adjust the du flags accordingly.)
+          apk add --no-cache coreutils findutils >/dev/null 2>&1 || true
+
+          NODE_NAME="${NODE_NAME:-unknown}"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          echo "============================================================"
+          echo "Node disk usage report"
+          echo "Node: ${NODE_NAME}"
+          echo "Time (UTC): ${TS}"
+          echo "Host mount: /host (read-only)"
+          echo "============================================================"
+          echo
+          echo "== Filesystems (host) =="
+          # df against host mount shows host FS view
+          df -hT /host || true
+          echo
+
+          # Directories to scan. This keeps it “comprehensive” but avoids recursion across pseudo-fs mounts.
+          # You can add/remove paths as needed.
+          SCAN_PATHS="/host/var /host/usr /host/opt /host/home /host/etc /host/root /host/srv /host/tmp"
+
+          echo "== Top directories by size (GiB), highest -> lowest =="
+          echo "(Note: this is *apparent size* of directories; it does not include other mounted filesystems.)"
+          echo
+
+          for p in $SCAN_PATHS; do
+            if [ -d "$p" ]; then
+              echo "---- ${p#/host} ----"
+              # One level deep “breakdown” plus the top-level total.
+              # -x : stay on same filesystem (prevents walking into other mounts under /var/lib/kubelet, etc.)
+              # --apparent-size : useful for “what’s in the folder” reporting
+              # -B1G : report in GiB blocks, easier to sort numerically
+              #
+              # We output: <GiB>\t<path>
+              du -x --apparent-size -B1G -d 2 "$p" 2>/dev/null \
+                | awk '{printf "%d\t%s\n",$1,$2}' \
+                | sort -nr \
+                | awk 'BEGIN{print "GiB\tPATH"} {gsub("^/host","",$2); printf "%d\t%s\n",$1,$2}' \
+                | head -n 60
+              echo
+            fi
+          done
+
+          echo "== Largest directories directly under / (GiB) =="
+          du -x --apparent-size -B1G -d 1 /host 2>/dev/null \
+            | awk '{printf "%d\t%s\n",$1,$2}' \
+            | sort -nr \
+            | awk 'BEGIN{print "GiB\tPATH"} {gsub("^/host","",$2); printf "%d\t%s\n",$1,$2}'
+          echo
+
+          echo "== Top 50 largest files on the node (GiB) =="
+          echo "(This can take longer on large disks.)"
+          # Stay on same filesystem with -xdev; use size in bytes -> GiB
+          find /host -xdev -type f -printf '%s\t%p\n' 2>/dev/null \
+            | sort -nr \
+            | head -n 50 \
+            | awk 'BEGIN{print "GiB\tBYTES\tPATH"} {gib=$1/1024/1024/1024; gsub("^/host","",$2); printf "%.2f\t%s\t%s\n",gib,$1,$2}'
+          echo
+
+          echo "Report complete."
+          # Keep the pod alive so logs are retrievable; adjust if you prefer it to exit/restart.
+          sleep 3600
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+          readOnly: true
+        resources:
+          requests:
+            cpu: 20m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+      tolerations:
+      - operator: Exists
+      nodeSelector:
+        kubernetes.io/os: linux
